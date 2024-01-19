@@ -1,48 +1,71 @@
-#' processing is split across small steps (df.1, df.2, ... df.22 for easier interpretation)  
+processing is split across small steps (df.1, df.2, ... df.22 for easier interpretation)  
+
+```{r}
 library(DBI)
 require(tidyverse)
+```
 
-#' load MIMIC-III derived and main data from physionet, requires physionet account
-#' see https://physionet.org/content/mimiciii/1.4/ and click on "Request access using Google BigQuery" 
-#' derived data contains a lot of useful abstractions like height, weight, blood pressure, elixhauser scores, etc. we don't need to work with raw data or ICD9 codes directly
-#' connection to derived MIMIC data 
+load MIMIC-III derived and main data from physionet, requires physionet account
+see https://physionet.org/content/mimiciii/1.4/ and click on "Request access using Google BigQuery" 
+derived data contains a lot of useful abstractions like height, weight, blood pressure, elixhauser scores, etc. we don't need to work with raw data or ICD9 codes directly
+connection to derived MIMIC data 
+
+```{r}
 con.1 <- dbConnect(  
   bigrquery::bigquery(),
   project = "physionet-data",
   dataset = "mimiciii_derived",
 )
+```
 
-#' connection to primary MIMIC data
+connection to primary MIMIC data
+
+```{r}
 con.2 <- dbConnect(
   bigrquery::bigquery(),
   project = "physionet-data",
   dataset = "mimiciii_clinical"
 )
+```
 
-#' Auth bigquery using gmail
-bigrquery::bq_auth(email = "YOUR@EMAIL") 
+Auth bigquery using gmail
 
-#' Read tables with metrics required for analysis 
+```{r}
+bigrquery::bq_auth(email = "EMAIL") 
+```
+
+Read tables with metrics required for analysis 
+
+```{r}
 hw.iii=dbReadTable(con.1,'heightweight') #' height and weight data
 icu.iii=dbReadTable(con.2,'icustays') ## icu stays 
 elix.iii=dbReadTable(con.1,'elixhauser_quan_score') ## elixhauser score
 elix.iii.2=dbReadTable(con.1,'elixhauser_quan') ## elixhauser score, including depression, substance abuse
 echo.iii=dbReadTable(con.1,'echodata_structured') ## echo data including blood pressure
-labevents=readRDS('labevents')    #' load all lab events
+labevents=dbReadTable(con.2,'labevents')    #' load all lab events
 a1c=labevents %>% filter(ITEMID==50852|ITEMID==50854)  ## A1C from lab events
 c.protein=labevents %>% filter(ITEMID==50889)  ## c protein from lab events
 chol=labevents %>% filter(ITEMID==50907) #' cholestorol from lab events
+```
 
-#' These 3 MIMIC-iii files (patients, admissions, textnotes) can be downloaded from physionet https://physionet.org/content/mimiciii/1.4/
+These 3 MIMIC-iii files (patients, admissions, textnotes) can be downloaded from physionet https://physionet.org/content/mimiciii/1.4/
+
+```{r}
 pat=read.csv('PATIENTS.csv')
 adm=read.csv('ADMISSIONS.csv')
 not=read.csv('NOTEEVENTS.csv')
+```
 
-#' we will only use discharge summaries from notes corpus
+we will only use discharge summaries from notes corpus
+
+```{r}
 df.1=
   not %>% tidytable::filter(CATEGORY=='Discharge summary')  
+```
 
-#' extract social history section of the note with reg exp, we try different matches like all caps, and others, and then combine them.
+extract social history section of the note with reg exp, we try different matches like all caps, and others, and then combine them.
+
+```{r}
 df.2=
   df.1 %>% 
   tidytable::mutate(text=str_match(tolower(TEXT) %>% gsub('[\r\n]',' ',.),'social history.[ ]*(.*)family history')[,2]) %>% 
@@ -63,42 +86,67 @@ df.2.other.3=
   tidytable::mutate(text=str_match(TEXT %>% gsub('[\r\n]',' ',.),'Social History.[ ]*(.*?)[A-Z]+:')[,2]) %>% 
   filter(!is.na(text))
 df.2.all=bind_rows(df.2,df.2.other.2,df.2.other.3) %>% mutate(TEXT=text)
+```
 
-#' now we will annotate notes with living with label
-#' helper function 
+now we will annotate notes with living with label
+helper function 
+
+```{r}
 get.maxscore=function(text,pipe=pipe)
 {
   p=pipe(text)
   print(p)
   (p %>% unlist)[which((p %>% unlist %>% names) =='score')] %>% which.max
 }
+```
 
-#' we will have to use reticulate to use UC NLP models, we will need python with prerequisites: transformers, spacy
-#' see documentation for UC CNN and bag of words (BOW) models for dependencies and installation
-#' https://github.com/BCHSI/social-determinants-of-health-clbp
+we will have to use reticulate to use UC NLP models, we will need python with prerequisites: transformers, spacy
+see documentation for UC CNN and bag of words (BOW) models for dependencies and installation
+https://github.com/BCHSI/social-determinants-of-health-clbp
+
+```{r}
 reticulate::use_python('/usr/bin/python3')
 library(reticulate)
 library(tidyverse)
 mod='hf.model.lw.shac' ## SHAC model
+```
+
+install python transformers before running next line
+
+```{r}
 tf=import('transformers')
 m=tf$AutoModelForSequenceClassification$from_pretrained(mod)
 t=tf$AutoTokenizer$from_pretrained(mod)
 pipe = tf$TextClassificationPipeline(model=m, tokenizer=t,padding="max_length",truncation=T, return_all_scores=T)
 
 levels=c("family", "others", "spouse", "alone", "partner", "not given")
+```
 
-#' annotate notes, long process
+annotate notes, long process
+
+```{r}
 df.3=df.2.all %>% rowwise %>% mutate(label=list(get.maxscore(TEXT,pipe)))
-#' get factor representation instead of numbers for lw (living with) label
+```
+
+get factor representation instead of numbers for lw (living with) label
+
+```{r}
 df.4=df.3 %>% ungroup %>% mutate(lw.label=factor(unlist(label),levels=1:length(levels),
                                                              labels=c(levels)))
 
 saveRDS(df.4,'df.4')
-#' now we will use spacy via reticulate to apply CNN model for extraction of marital status
+```
+
+now we will use spacy via reticulate to apply CNN model for extraction of marital status
+
+```{r}
 spacy=import('spacy')
 nlp=spacy$load("en_sdoh_cnn_ner_cui")
+```
 
-#' this function applies NLP model to texts in parallel to extract label_ (probably shorter function could be written but I am not expert in reticulate/python combo)
+this function applies NLP model to texts in parallel to extract label_ (probably shorter function could be written but I am not expert in reticulate/python combo)
+
+```{r}
 nlp_extr.all=function(texts){
   docs=nlp$pipe(texts)
   ap=function(i) {
@@ -110,11 +158,17 @@ nlp_extr.all=function(texts){
   }
   return(iterate(docs,ap,simplify = F) )
 }
+```
 
-#' now perform annotation, long process ~several hours
+now perform annotation, long process ~several hours
+
+```{r}
 df.5=df.4 %>% mutate(extr=nlp_extr.all(TEXT))
+```
 
-#' annotations come in complex format, which we will need to work with to extract the actual label
+annotations come in complex format, which we will need to work with to extract the actual label
+
+```{r}
 df.6=
   df.5 %>% 
   rowwise %>% 
@@ -123,8 +177,11 @@ df.6=
   unnest(extr,keep_empty = T) %>% 
   unnest_wider(extr,names_sep='_')  %>% 
   separate(extr_1,sep=':',into=c('category','label')) 
+```
 
-#' processing continues, we also want to only use marital status, since model extracts many other label categories too
+processing continues, we also want to only use marital status, since model extracts many other label categories too
+
+```{r}
 df.7=
   df.6 %>% 
   mutate(label=ifelse(is.infinite(extr.na)|extr.na==0,'not given',label)) %>% 
@@ -135,22 +192,38 @@ df.7=
   slice(1) %>% 
   ungroup %>% 
   pivot_wider(names_from=category,values_from=label)  
+```
 
-#' set names cnn.label will be marital status extracted by CNN
+set names cnn.label will be marital status extracted by CNN
+
+```{r}
 df.8=
   df.7 %>% 
   rename(cnn.label="Marital_or_partnership_status") %>% 
   mutate(cnn.label=trimws(tolower(cnn.label))) 
+```
 
-#' Save for faster access
+Save for faster access
+
+```{r}
 saveRDS(df.8,'df.8')
+```
 
-#' We are done with CNN model, now we can extract marital status using Bag of words model (BOW)
+We are done with CNN model, now we can extract marital status using Bag of words model (BOW)
+
+```{r}
 nlp=spacy$load("en_sdoh_bow_cui") #' restart r session, if reticulate function doesn't work with other model in cache
-#' annotate, long process
-df.9=readRDS('df.8') %>% mutate(extr=nlp_extr.all(TEXT))
+```
 
-#' do similiar processing for BOW model as for CNN
+annotate, long process
+
+```{r}
+df.9=readRDS('df.8') %>% mutate(extr=nlp_extr.all(TEXT))
+```
+
+do similiar processing for BOW model as for CNN
+
+```{r}
 df.10=
   df.9 %>% 
   rowwise %>% 
@@ -170,18 +243,22 @@ df.11=
   slice(1) %>% 
   ungroup %>% 
   pivot_wider(names_from=category,values_from=label)  
+```
 
+set names, hybrid.label will be BOW model marital status 
 
-#' set names, hybrid.label will be BOW model marital status 
+```{r}
 df.12=
   df.11 %>% 
   rename(hybrid.label="Marital_or_partnership_status") %>% 
   mutate(hybrid.label=trimws(tolower(hybrid.label))) 
+```
 
+now an important step we recode partnered patients using lw label. 
+We consider partnered only patients who live with their partner, girlfriend, boyfriend or significant other
+All other partnered are considered dating
 
-#' now an important step we recode partnered patients using lw label. 
-#' We consider partnered only patients who live with their partner, girlfriend, boyfriend or significant other
-#' All other partnered are considered dating
+```{r}
 df.13= 
   df.12 %>% 
   select(-extr.na) %>% 
@@ -205,8 +282,11 @@ df.13=
     cnn.label=="partner"&lw.label=="alone"~"dating",
     .default = cnn.label 
   )) 
+```
 
-#' Now we do majority voting, if 2 out 3 votes match on marital status we use the label, otherwise we set to NA
+Now we do majority voting, if 2 out 3 votes match on marital status we use the label, otherwise we set to NA
+
+```{r}
 df.14=
   df.13 %>% 
   left_join(adm,by=c("SUBJECT_ID","HADM_ID")) %>% 
@@ -229,14 +309,17 @@ df.14=
 
 
 saveRDS(df.14,'df.14')
-df.14=readRDS('df.14')
-library(tidytable)  #' tidytable speeds up operations
 
 # df.nursing=df.iii.allnotes.3 %>% 
 #   filter(CATEGORY=='Nursing/other') %>% 
 #   filter(label=='married') #' only reliable in married
+```
 
-#' We will get the latest discharge summary if there are multiple entries during one admission
+We will get the latest discharge summary if there are multiple entries during one admission
+
+```{r}
+df.14=readRDS('df.14')
+library(tidytable)  #' tidytable speeds up operations
   df.15=
     df.14 %>% 
   #  bind_rows(df.nursing) %>% 
@@ -248,8 +331,13 @@ library(tidytable)  #' tidytable speeds up operations
     ungroup %>% 
     select(-contains("ROW_ID"))  
   
-#' The next calculations combine social history notes with metrics such as height, weight, patient details, admission details, A1C, etc. 
-  detach('package:tidytable') #' tidy fill doesn't work correctly with tidytable
+detach('package:tidytable') #' tidy fill doesn't work correctly with tidytable
+
+```
+
+The next calculations combine social history notes with metrics such as height, weight, patient details, admission details, A1C, etc. 
+
+```{r}
   require(tidyverse)
   df.16=
   df.15 %>% 
@@ -270,10 +358,12 @@ library(tidytable)  #' tidytable speeds up operations
   left_join(a1c %>% 
               filter(!is.na(HADM_ID),ITEMID==50852) %>% select(HADM_ID,ITEMID,VALUENUM) %>% 
               distinct(HADM_ID,ITEMID,.keep_all=T), by='HADM_ID')
+```
 
+add other metrics: protein and cholesterol levels
+if there are multiple measurements in lab events per admission take only one metric per admission
 
-#' add other metrics: protein and cholesterol levels
-#' if there are multiple measurements in lab events per admission take only one metric per admission
+```{r}
   df.17=
   df.16 %>% 
   tidytable::left_join(c.protein %>% select(HADM_ID,VALUENUM) %>% 
@@ -282,16 +372,21 @@ library(tidytable)  #' tidytable speeds up operations
   tidytable::left_join(chol %>% select(HADM_ID,VALUENUM) %>% 
                          rename(cholesterol.total=VALUENUM) %>% distinct(HADM_ID,.keep_all=T),
                        by='HADM_ID') 
+```
 
+convert datetime to date format and set weight to first measurement of weight
 
-#' convert datetime to date format and set weight to first measurement of weight
+```{r}
   df.18=
   df.17 %>%   
   mutate(ADMITTIME=lubridate::as_date(ADMITTIME)) %>%   
   mutate(weight=weight_first)
+```
 
-#' delete entries, where there is no marital status detected, calculate patient's age and time between admissions 
-#' delete outliers (aged > 120 and aged < 18)
+delete entries, where there is no marital status detected, calculate patient's age and time between admissions 
+delete outliers (aged > 120 and aged < 18)
+
+```{r}
   df.19=
   df.18 %>% 
   filter(label!='not given',label!='na',!is.na(label)) %>% 
@@ -303,9 +398,12 @@ library(tidytable)  #' tidytable speeds up operations
   mutate(age=trunc((ADMITTIME-DOB)/365)) %>% 
   mutate(age=as.integer(age)) %>%  
   filter(age<120,age>=18)  
+```
 
-#' we select only married, divorced and single people since UC model showed high precision for these groups only, other groups are not reliable
-#' we select only latest admission per patient
+we select only married, divorced and single people since UC model showed high precision for these groups only, other groups are not reliable
+we select only latest admission per patient
+
+```{r}
   df.20=
   df.19 %>% 
   # filter(label %in% c("married",
@@ -328,16 +426,22 @@ library(tidytable)  #' tidytable speeds up operations
   mutate(label=fct_drop(label)) 
 
   df.20$label %>% table
-#' bin admissions into groups
+```
+
+bin admissions into groups
+
+```{r}
   df.20.married=df.20 %>%filter(label=='married') 
   df.20.single=df.20 %>%filter(label=='single') 
   df.20.divorced=df.20 %>% filter(label=='divorced')
   df.20.dating=df.20 %>% filter(label=='dating')
   df.20.partner=df.20 %>% filter(label=='partner')
   df.20.widowed=df.20 %>% filter(label=='widowed')
-  
-  
-#' we can see that mean ages are quite different , we need to downsample larger groups
+```
+
+we can see that mean ages are quite different , we need to downsample larger groups
+
+```{r}
 df.20.married$age %>% mean
 df.20.single$age %>% mean
 df.20.divorced$age %>% mean
@@ -407,13 +511,17 @@ df.21=bind_rows(df.20.married.2
                 ,df.20.dating
                 ,df.20.partner
                 ,df.20.single.2)
+```
 
-#' Now average age is ~53
+Now average age is ~53
 
-
+```{r}
 require(ggpubr)
+```
 
-#' Build boxplot comparing continous health metrics between single , married and divorced groups
+Build boxplot comparing continous health metrics between single , married and divorced groups
+
+```{r}
 bxp=
 #   bind_rows(
 #   df.20.married.2,
@@ -425,7 +533,7 @@ bxp=
   mutate(age=trunc(as.integer(lubridate::as_date(ADMITTIME)-DOB)/365)) %>%   
   mutate(age=as.integer(age)) %>% 
   group_by(SUBJECT_ID) %>% 
-  #mutate(admissions=n()) %>% 
+  mutate(admissions=n()) %>% 
   arrange(desc(ADMITTIME)) %>% slice(1) %>% ungroup %>% 
   left_join(adm,by='HADM_ID',copy=F)   %>% 
   mutate(DISCHTIME=lubridate::as_datetime(DISCHTIME.x)) %>% 
@@ -453,14 +561,17 @@ bxp=
   geom_pwc(method='t_test',vjust=2,ref.group=2)
 
 bxp 
-#' Although there was difference, especially in A1C levels and elixhauser
-#' after adjusting p values no significant changes were detected
 ggadjust_pvalue(
   bxp, p.adjust.method = "holm",
   symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, Inf), symbols = c("****", "***", "**", "*", "")),
   label = "p adjusted={p.adj.format} {p.adj.signif}", hide.ns = F
 )
+```
 
+Although there was difference, especially in A1C levels and elixhauser
+after adjusting p values no significant changes were detected
+
+```{r}
 
 
 # bind_rows(
@@ -538,9 +649,11 @@ df.21=
     elixhauser_vanwalraven.delta=(elixhauser_vanwalraven-lag(elixhauser_vanwalraven))/lag(elixhauser_vanwalraven)
   ) %>%
   ungroup 
+```
 
+calculate more metrics and 'change' column indicating if change in marital status happened
 
-#' calculate more metrics and 'change' column indicating if change in marital status happened
+```{r}
 df.22=df.21 %>%  
   mutate(DOB=lubridate::as_date(DOB)) %>% 
   mutate(age=as.numeric(trunc((lubridate::as_date(ADMITTIME)-DOB)/365))) %>% 
@@ -586,8 +699,11 @@ df.22.unchanged=
   filter(change=='Unchanged')
 
 df.22.change=bind_rows(df.22.married,df.22.other)
+```
 
-#' groups have different age, we need to downsample again
+groups have different age, we need to downsample again
+
+```{r}
 df.22.married$age %>% mean
 df.22.other$age %>% mean
 df.22.unchanged$age %>% mean
@@ -637,10 +753,11 @@ ggadjust_pvalue(
   mutate(change=ifelse(label!=label.prev&label=='married',"Changed",#"Got married",
                        ifelse(label!=label.prev&label!='married',"Changed",#"Other change",
                               "Unchanged"))) %>% pull(change) %>% table
+```
 
+Display Changed vs Unchanged chart
 
-#' Display Changed vs Unchanged chart
-
+```{r}
   bind_rows(df.22.unchanged.2,df.22.change) %>% 
   #filter(time<=5*365) %>%
     mutate(change=ifelse(label!=label.prev&label=='married',"Status changed",
@@ -676,9 +793,11 @@ ggadjust_pvalue(
   facet_wrap(~vars)+
   xlab("Comparative Diagnosis (Dx) Status from the First Admission to Second Admission")+
   ylab('Percentage of Patient admission event pairs')
+```
 
+Seperate analysis for "Got married" vs "No change" vs "Other change"
 
-#' Seperate analysis for "Got married" vs "No change" vs "Other change"
+```{r}
   bind_rows(df.22.unchanged.2,df.22.change) %>% 
     mutate(change=ifelse(label!=label.prev&(label=='married'),"Got married",
                          ifelse(label!=label.prev&label!='married',"Other change",
@@ -746,5 +865,13 @@ ggadjust_pvalue(
     symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, Inf), symbols = c("****", "***", "**", "*", "")),
     label = "p adjusted={p.adj.format} {p.adj.signif}", hide.ns = F
   )
-  
+```
 
+
+
+---
+title: podium_git.R
+author: scherbak
+date: '2024-01-19'
+
+---
