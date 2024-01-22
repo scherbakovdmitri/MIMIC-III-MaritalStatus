@@ -28,10 +28,15 @@ icu.iii=dbReadTable(con.2,'icustays') ## icu stays
 elix.iii=dbReadTable(con.1,'elixhauser_quan_score') ## elixhauser score
 elix.iii.2=dbReadTable(con.1,'elixhauser_quan') ## elixhauser score, including depression, substance abuse
 echo.iii=dbReadTable(con.1,'echodata_structured') ## echo data including blood pressure
-labevents=readRDS('labevents')    #' load all lab events
+if (file.exists('labevents'))    ### for faster future runs we save variables in local files
+labevents=readRDS('labevents') else 
+{
+labevents=dbReadTable(con.2,'labevents')    #' load all lab events
+saveRDS(labevents,'labevents')
+}
 a1c=labevents %>% filter(ITEMID==50852|ITEMID==50854)  ## A1C from lab events
 c.protein=labevents %>% filter(ITEMID==50889)  ## c protein from lab events
-chol=labevents %>% filter(ITEMID==50907) #' cholestorol from lab events
+chol=labevents %>% filter(ITEMID==50907) #' cholesterol from lab events
 
 #' These 3 MIMIC-iii files (patients, admissions, textnotes) can be downloaded from physionet https://physionet.org/content/mimiciii/1.4/
 pat=read.csv('PATIENTS.csv')
@@ -80,6 +85,7 @@ reticulate::use_python('/usr/bin/python3')
 library(reticulate)
 library(tidyverse)
 mod='hf.model.lw.shac' ## SHAC model
+#' install python transformers before running next line
 tf=import('transformers')
 m=tf$AutoModelForSequenceClassification$from_pretrained(mod)
 t=tf$AutoTokenizer$from_pretrained(mod)
@@ -88,15 +94,14 @@ pipe = tf$TextClassificationPipeline(model=m, tokenizer=t,padding="max_length",t
 levels=c("family", "others", "spouse", "alone", "partner", "not given")
 
 #' annotate notes, long process
+#' afterwards get factor representation instead of numbers for lw (living with) label
+if (file.exists('df.4'))    ### for faster future runs we save variables in local files and load them from disk if they exist on disk
+  df.4=readRDS('df.4') else {
 df.3=df.2.all %>% rowwise %>% mutate(label=list(get.maxscore(TEXT,pipe)))
-#' get factor representation instead of numbers for lw (living with) label
 df.4=df.3 %>% ungroup %>% mutate(lw.label=factor(unlist(label),levels=1:length(levels),
-                                                             labels=c(levels)))
-
+                                                             labels=c(levels))) 
 saveRDS(df.4,'df.4')
-#' now we will use spacy via reticulate to apply CNN model for extraction of marital status
-spacy=import('spacy')
-nlp=spacy$load("en_sdoh_cnn_ner_cui")
+}
 
 #' this function applies NLP model to texts in parallel to extract label_ (probably shorter function could be written but I am not expert in reticulate/python combo)
 nlp_extr.all=function(texts){
@@ -111,10 +116,18 @@ nlp_extr.all=function(texts){
   return(iterate(docs,ap,simplify = F) )
 }
 
-#' now perform annotation, long process ~several hours
+#' we will use spacy via reticulate to apply CNN model for extraction of marital status
+#' perform annotation, long process ~several hours
+#' annotations come in complex format, which we will need to work with to extract the actual label
+#' processing continues, we also want to only use marital status, since model extracts many other label categories too
+#' at last set names: cnn.label will be marital status extracted by CNN
+
+if (file.exists('df.8'))    ### for faster future runs we save variables in local files and load them from disk if they exist on disk
+  df.8=readRDS('df.8') else {
+spacy=import('spacy')
+nlp=spacy$load("en_sdoh_cnn_ner_cui")
 df.5=df.4 %>% mutate(extr=nlp_extr.all(TEXT))
 
-#' annotations come in complex format, which we will need to work with to extract the actual label
 df.6=
   df.5 %>% 
   rowwise %>% 
@@ -124,7 +137,6 @@ df.6=
   unnest_wider(extr,names_sep='_')  %>% 
   separate(extr_1,sep=':',into=c('category','label')) 
 
-#' processing continues, we also want to only use marital status, since model extracts many other label categories too
 df.7=
   df.6 %>% 
   mutate(label=ifelse(is.infinite(extr.na)|extr.na==0,'not given',label)) %>% 
@@ -136,21 +148,30 @@ df.7=
   ungroup %>% 
   pivot_wider(names_from=category,values_from=label)  
 
-#' set names cnn.label will be marital status extracted by CNN
 df.8=
   df.7 %>% 
   rename(cnn.label="Marital_or_partnership_status") %>% 
   mutate(cnn.label=trimws(tolower(cnn.label))) 
 
-#' Save for faster access
-saveRDS(df.8,'df.8')
+saveRDS(df.8,'df.8') #Save for faster access
+
+}
 
 #' We are done with CNN model, now we can extract marital status using Bag of words model (BOW)
-nlp=spacy$load("en_sdoh_bow_cui") #' restart r session, if reticulate function doesn't work with other model in cache
-#' annotate, long process
-df.9=readRDS('df.8') %>% mutate(extr=nlp_extr.all(TEXT))
-
+#' annotation is long process
 #' do similiar processing for BOW model as for CNN
+#' set names, hybrid.label will be BOW model marital status 
+#' df.13: now an important step, we recode partnered patients using lw label. 
+#' We consider partnered only patients who live with their partner, girlfriend, boyfriend or significant other
+#' All other partnered are considered dating
+#' At last (df.14) we do majority voting, if 2 out 3 votes match on marital status we use the label, otherwise we set to NA
+
+if (file.exists('df.14'))    ### for faster future runs we save variables in local files and load them from disk if they exist on disk
+df.14=readRDS('df.14') else
+{
+nlp=spacy$load("en_sdoh_bow_cui") #' restart r session, if reticulate function doesn't work with other model in cache
+df.9=df.8 %>% mutate(extr=nlp_extr.all(TEXT))
+
 df.10=
   df.9 %>% 
   rowwise %>% 
@@ -172,16 +193,11 @@ df.11=
   pivot_wider(names_from=category,values_from=label)  
 
 
-#' set names, hybrid.label will be BOW model marital status 
 df.12=
   df.11 %>% 
   rename(hybrid.label="Marital_or_partnership_status") %>% 
   mutate(hybrid.label=trimws(tolower(hybrid.label))) 
 
-
-#' now an important step we recode partnered patients using lw label. 
-#' We consider partnered only patients who live with their partner, girlfriend, boyfriend or significant other
-#' All other partnered are considered dating
 df.13= 
   df.12 %>% 
   select(-extr.na) %>% 
@@ -206,7 +222,6 @@ df.13=
     .default = cnn.label 
   )) 
 
-#' Now we do majority voting, if 2 out 3 votes match on marital status we use the label, otherwise we set to NA
 df.14=
   df.13 %>% 
   left_join(adm,by=c("SUBJECT_ID","HADM_ID")) %>% 
@@ -226,15 +241,11 @@ df.14=
                                                         x=='unknown (default)'~'not given',
                                                         .default=x))) %>%
   mutate(across((contains('label')&!contains('alone'))&!contains('ref.livingwith')|contains('vote'),~factor(.x)))#,levels=c('single','not given','married','partner','engaged to be married','widowed','separated','divorced','dating','relationship breakdown'))))  
-
-
 saveRDS(df.14,'df.14')
-df.14=readRDS('df.14')
-library(tidytable)  #' tidytable speeds up operations
+}
 
-# df.nursing=df.iii.allnotes.3 %>% 
-#   filter(CATEGORY=='Nursing/other') %>% 
-#   filter(label=='married') #' only reliable in married
+#' tidytable speeds up operations
+library(tidytable) 
 
 #' We will get the latest discharge summary if there are multiple entries during one admission
   df.15=
@@ -337,7 +348,7 @@ library(tidytable)  #' tidytable speeds up operations
   df.20.widowed=df.20 %>% filter(label=='widowed')
   
   
-#' we can see that mean ages are quite different , we need to downsample larger groups
+#' we can see that mean ages are quite different , we need to downsample larger groups using weights which are manually picked to make even groups 
 df.20.married$age %>% mean
 df.20.single$age %>% mean
 df.20.divorced$age %>% mean
@@ -359,7 +370,7 @@ df.20.dating$age %>% mean
 #   mutate(sample_weight=1/age^5) %>%
 #   slice_sample(n=ceiling(nrow(.)*0.8),weight_by = sample_weight)
 
-
+set.seed(1)
 df.20.married.2=df.20.married %>%
   mutate(sample_weight=1/age^2.5) %>%
   slice_sample(n=ceiling(nrow(.)*0.3),weight_by = sample_weight)
@@ -385,13 +396,14 @@ df.20.partner.2=df.20.partner %>%
   slice_sample(n=ceiling(nrow(.)*0.6),weight_by = sample_weight)
 df.20.partner.2$age %>% mean
 
+#' a test to check how similiar are the variances, making variances similar is too difficult using this sample size
 car::leveneTest(age~label,bind_rows(df.20.divorced.2,df.20.married.2))
 car::leveneTest(age~label,bind_rows(df.20.partner,df.20.married.2))
 car::leveneTest(age~label,bind_rows(df.20.widowed.2,df.20.married.2))
 car::leveneTest(age~label,bind_rows(df.20.partner.2,df.20.dating.2))
 car::leveneTest(age~label,bind_rows(df.20.partner.2,df.20.single.2))
 
-
+#' variances can be checked on histogram
 layout(matrix(c(1, 2, 3, 4,5,6), nrow = 2, 
               ncol = 3, byrow = TRUE)) 
 df.20.married.2$age %>% hist
@@ -404,8 +416,8 @@ df.20.single.2$age %>% hist
 df.21=bind_rows(df.20.married.2
                 ,df.20.divorced.2
                 ,df.20.widowed.2
-                ,df.20.dating
-                ,df.20.partner
+                ,df.20.dating.2
+                ,df.20.partner.2
                 ,df.20.single.2)
 
 #' Now average age is ~53
@@ -495,6 +507,7 @@ ggadjust_pvalue(
   ylab('Percentage of patients with the given diagnosis')+
   xlab("")+
   theme_minimal()+
+  #theme(text = element_text(size=22))+       ## for print only
   scale_fill_manual(values=    c("#003f5c",
                                    #"#2f4b7c",
                                    "#665191",
@@ -609,7 +622,7 @@ var.test(df.22.unchanged.2$age,df.22.change$age)
 # df.9.all.younger.51$age %>% mean
 
 
-bind_rows(df.22.unchanged.2,df.22.change) %>% 
+bxp.change=bind_rows(df.22.unchanged.2,df.22.change) %>% 
   mutate(change=ifelse(change=='Unchanged',change,"Changed")) %>% 
   ungroup %>% 
   filter(time<=5*365) %>% 
@@ -665,16 +678,17 @@ ggadjust_pvalue(
   geom_col(position='dodge2',color='darkgrey')+
   scale_color_hue(direction = -1)+
   scale_fill_manual(values=c('#88CCEE',"white")) +
-  geom_errorbar(color='red',aes(ymin=c.min*100,ymax=c.max*100),position=position_dodge(width=0.9),width=0.2)+
+  geom_errorbar(color='red',aes(ymin=c.min*100,ymax=c.max*100),position=position_dodge(width=0.9),width=0.4)+
   theme_minimal()+
   theme( axis.text.x = element_text( angle = 45 ,
                                      vjust = 1 ,
                                      hjust = 1 ) )+
   theme(aspect.ratio = 2.1/1)+
   theme(legend.title = element_blank(),legend.position = "top")+
-  theme(axis.title = element_text(size = 9))+              # Axis titles
+  #theme(text = element_text(size=20))+
   facet_wrap(~vars)+
-  xlab("Comparative Diagnosis (Dx) Status from the First Admission to Second Admission")+
+  xlab('')+
+  #xlab("Comparative Diagnosis (Dx) Status from the First Admission to Second Admission")+
   ylab('Percentage of Patient admission event pairs')
 
 
